@@ -1,0 +1,282 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <SPI.h>
+#include <MFRC522.h>
+#include <Wire.h>
+#include <MPU6050.h>
+#include <math.h>
+
+#define RFID_SS_PIN   D3
+#define RFID_RST_PIN  D2
+#define MFRC522_SCK   D8
+#define MFRC522_MOSI  D10
+#define MFRC522_MISO  D9
+
+#define LASER_PIN     D0  
+#define ACC_SDA       D4
+#define ACC_SCL       D5
+#define LED_PIN       D6
+
+const char* ssid        = "SMART-PRD-ENG"; //SMART-PRD-ENG
+const char* password    = "7uRe:6:hw~a"; //7uRe:6:hw~a
+const char* mqtt_server = "rpimaxim.local";
+const int   mqtt_port   = 1883;
+
+const char* TOPIC_RFID       = "home/sensors/rfid";
+const char* TOPIC_FLOW       = "home/sensors/flowrate";
+const char* TOPIC_LED_CMD    = "home/sensors/led";
+const char* TOPIC_LED_STATUS = "ivision/flow/led_status";
+
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+
+MFRC522 mfrc522(RFID_SS_PIN, RFID_RST_PIN);
+
+MPU6050 mpu;
+int16_t ax, ay, az;
+long baselineMag = 16384;
+const int SHAKE_THRESHOLD = 250;
+const int DIFF_DEADZONE   = 100;
+
+const int FLOW_WINDOW = 60;
+int   dropsSecond[FLOW_WINDOW];
+int   flowState[FLOW_WINDOW];
+
+int   flowIndex  = 0;
+bool  flowFilled = false;
+float avgFlow    = 30.0f;  
+
+int   dropCount  = 0;
+int   lastLaser  = LOW;
+
+bool          shaken        = false;
+bool          inShakePause  = false;
+unsigned long shakeStartMs  = 0;
+const unsigned long SHAKE_PAUSE_MS = 10000;
+
+bool          ledFlashing       = false;
+int           ledTogglesLeft    = 0;
+unsigned long lastLedToggleMs   = 0;
+const unsigned long LED_FLASH_INTERVAL_MS = 200;
+
+bool shakeLedActive = false;
+unsigned long lastShakeBlink = 0;
+const unsigned long SHAKE_BLINK_INTERVAL = 200;
+
+void setupWiFi() {
+  Serial.print("Connecting WiFi");
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(300);
+  }
+  Serial.println("\nWiFi OK.");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+void calibrateMPU() {
+  Serial.println("Calibrating MPU6050... keep device still.");
+  long sum = 0;
+  const int samples = 200;
+
+  for (int i = 0; i < samples; i++) {
+    mpu.getAcceleration(&ax, &ay, &az);
+    long mag = sqrt((long)ax * ax + (long)ay * ay + (long)az * az);
+    sum += mag;
+    delay(10);
+  }
+
+  baselineMag = sum / samples;
+  Serial.print("MPU baseline magnitude = ");
+  Serial.println(baselineMag);
+}
+
+void startLedFlash(int flashes) {
+  if (flashes <= 0) return;
+  ledFlashing = true;
+  ledTogglesLeft = flashes * 2;
+  lastLedToggleMs = millis();
+  digitalWrite(LED_PIN, HIGH);
+  ledTogglesLeft--;
+}
+
+void processLedFlash() {
+  if (ledFlashing) {
+    if (millis() - lastLedToggleMs >= LED_FLASH_INTERVAL_MS) {
+      lastLedToggleMs = millis();
+      digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+      ledTogglesLeft--;
+
+      if (ledTogglesLeft <= 0) {
+        ledFlashing = false;
+        digitalWrite(LED_PIN, LOW);
+      }
+    }
+  }
+
+  if (shakeLedActive) {
+    if (millis() - lastShakeBlink >= SHAKE_BLINK_INTERVAL) {
+      lastShakeBlink = millis();
+      digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+    }
+  }
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String t = String(topic);
+  String msg = "";
+  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
+  msg.trim();
+
+  if (t == TOPIC_LED_CMD) {
+    if (msg == "flash3") {
+      startLedFlash(3);
+
+      String ledMsg = "{\"event\":\"bind_flash\",\"status\":\"done\"}";
+      mqttClient.publish(TOPIC_LED_STATUS, ledMsg.c_str());
+    }
+    else if (msg == "flash5") {
+      startLedFlash(5);
+    }
+  }
+}
+
+void ensureMqttConnected() {
+  if (!mqttClient.connected()) {
+    mqttClient.connect("IVisionS3");
+    mqttClient.subscribe(TOPIC_LED_CMD);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(800);
+
+  Serial.println("\nIVision ESP32-S3 Booting...");
+
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  pinMode(LASER_PIN, INPUT_PULLUP);
+  lastLaser = digitalRead(LASER_PIN);
+
+  Wire.begin(ACC_SDA, ACC_SCL);
+  mpu.initialize();
+  calibrateMPU();
+
+  SPI.begin(MFRC522_SCK, MFRC522_MISO, MFRC522_MOSI, RFID_SS_PIN);
+  mfrc522.PCD_Init();
+
+  setupWiFi();
+  mqttClient.setServer(mqtt_server, mqtt_port);
+  mqttClient.setCallback(mqttCallback);
+
+  for (int i = 0; i < FLOW_WINDOW; i++) {
+    dropsSecond[i] = 30;
+    flowState[i]   = 1;
+  }
+  flowIndex = 0;
+  flowFilled = true;
+  avgFlow = 30.0;
+
+  Serial.println("Flow buffer prefilled with 30 → initial avg = 30.0");
+}
+
+void loop() {
+  if (!mqttClient.connected()) ensureMqttConnected();
+  mqttClient.loop();
+
+  processLedFlash();
+
+  if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
+
+    String uid = "";
+    for (byte i = 0; i < mfrc522.uid.size; i++) {
+      if (mfrc522.uid.uidByte[i] < 0x10) uid += "0";
+      uid += String(mfrc522.uid.uidByte[i], HEX);
+    }
+    uid.toUpperCase();
+
+    String msg = "{";
+    msg += "\"device\":\"IVisionS3\",";
+    msg += "\"UID\":\"" + uid + "\"";
+    msg += "}";
+
+    mqttClient.publish(TOPIC_RFID, msg.c_str());
+    Serial.println("RFID -> " + msg);
+
+    startLedFlash(3);
+
+    for (int i = 0; i < FLOW_WINDOW; i++) {
+        dropsSecond[i] = 30;
+        flowState[i]   = 1;
+    }
+    flowIndex = 0;
+    flowFilled = true;
+    avgFlow = 30.0;
+    Serial.println("Flowrate RESET to 30 due to RFID scan");
+
+    mfrc522.PICC_HaltA();
+    mfrc522.PCD_StopCrypto1();
+  }
+
+  int reading = digitalRead(LASER_PIN);
+  if (lastLaser == LOW && reading == HIGH) dropCount++;
+  lastLaser = reading;
+
+  static unsigned long lastSec = millis();
+  if (millis() - lastSec >= 1000) {
+    lastSec = millis();
+
+    // SHAKE
+    mpu.getAcceleration(&ax, &ay, &az);
+    long mag = sqrt((long)ax * ax + (long)ay * ay + (long)az * az);
+    long diff = labs(mag - baselineMag);
+    if (diff < DIFF_DEADZONE) diff = 0;
+
+    if (diff >= SHAKE_THRESHOLD) {
+      shaken = true;
+      shakeLedActive = true;
+      ledFlashing = false;
+
+      if (!inShakePause) {
+        inShakePause = true;
+        shakeStartMs = millis();
+      }
+    }
+
+    if (inShakePause && (millis() - shakeStartMs >= SHAKE_PAUSE_MS)) {
+      inShakePause = false;
+      shaken = false;
+      shakeLedActive = false;
+      digitalWrite(LED_PIN, LOW);
+    }
+
+    int drops = dropCount;
+    dropCount = 0;
+
+    if (!inShakePause) {
+      dropsSecond[flowIndex] = drops;
+      flowState[flowIndex]   = (drops > 0);
+
+      flowIndex++;
+      if (flowIndex >= FLOW_WINDOW) {
+        flowIndex = 0;
+        flowFilled = true;
+      }
+
+      int count = flowFilled ? FLOW_WINDOW : flowIndex;
+      long sum = 0;
+      for (int i = 0; i < count; i++) sum += dropsSecond[i];
+      avgFlow = (float)sum / count;
+    }
+
+    String payload = "{";
+    payload += "\"flowrateAverage\":" + String(avgFlow, 3);
+    payload += "}";
+
+    mqttClient.publish(TOPIC_FLOW, payload.c_str());
+    Serial.println("Flow -> " + payload);
+  }
+}
